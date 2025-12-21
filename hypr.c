@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <glob.h>
 
 /*
  * TODO
@@ -23,7 +24,14 @@
  * + DONE _Pre-load files and re-load them if changed -> will reduce load_
  * + NOT NEEDED _Poll in a smarter way -- do not re-create the pollfd structure (?)_
  * + DONE _Return 405 Method Not Allowed instead of empty response_
- * + HTTPS Serving. Use OpenSSL
+ * + DONE _HTTPS Serving. Use OpenSSL_
+ * + Allow a config file that can be used to specify command-line options, e.g.
+ *   dir=/bla/bla/bla
+ *   key=mykey.key
+ *   cert=mycert.crt
+ *   port=4380
+ *   sport=4330
+ *   ...
  * Additionals (*)
  * + Allow routing methods through CGIs
  * + FastCGI support
@@ -53,12 +61,21 @@ loglevel_tostr(int loglevel) {
     assert(0 && "Invalid log level specified");
 }
 
+char *
+timestr(void) {
+    static char timebuf[256];
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    strftime(timebuf, 256, "%T", tm);
+    return timebuf;
+}
+
 void
 message(int loglevel, const char *fmt, ...) {
     if (loglevel > enforce_loglevel) return;
     va_list vl;
     va_start(vl, fmt);
-    printf("%s: ", loglevel_tostr(loglevel));
+    printf("[%s %s] ", timestr(), loglevel_tostr(loglevel));
     vprintf(fmt, vl);
     putchar('\n');
     va_end(vl);
@@ -114,7 +131,44 @@ blacklist_append(char *path) {
     blacklist[blacklist_len - 1] = path;
 }
 
-#include <glob.h>
+struct file_cache {
+    char *filepath;
+    char *file_contents;
+    time_t last_edit;
+};
+
+struct file_cache *filecache = NULL;
+size_t filecache_size = 0;
+
+void
+free_filecache(void) {
+    for (size_t i = 0; i < filecache_size; i++) {
+        if (filecache[i].file_contents != NULL) free(filecache[i].file_contents);
+        if (filecache[i].filepath != NULL) free(filecache[i].filepath);
+    }
+    free(filecache);
+}
+
+struct file_cache*
+filecache_find(const char *filepath) {
+    for (size_t i = 0; i < filecache_size; i++) {
+        if (!strcmp(filepath, filecache[i].filepath))
+            return &filecache[i];
+    }
+    return NULL;
+}
+
+void
+file_cache_append(const char *filepath, char *file, time_t last_edit) {
+    char *filepath_alloc = malloc(strlen(filepath) + 1);
+    strcpy(filepath_alloc, filepath);
+    filecache_size++;
+    filecache = realloc(filecache, filecache_size * sizeof(struct file_cache));
+    filecache[filecache_size - 1] = 
+        (struct file_cache){
+            filepath_alloc, file, last_edit
+        };
+}
 
 int
 resource_glob(glob_t *glb, const char *resource, const char *dir) {
@@ -220,11 +274,12 @@ accept_secure_conn(SSL_CTX *ctx, pid_t sock) {
     assert(ctx != NULL);
 
     struct peer peer = accept_conn(sock);
+    //printf("Here1\n");
     if (peer.sock == -1) return peer;
 
     SSL *ssl = SSL_new(ctx);
     SSL_set_fd(ssl, peer.sock);
-
+    
     int ret;
 try_again:
     if ((ret = SSL_accept(ssl)) <= 0) {
@@ -234,7 +289,7 @@ try_again:
         return (struct peer) {-1,NULL,0,0,0,0};
     }
 
-    //message(LOG_DEBUG, "accepted secure connection from %s", ipstr(peer.ip));
+    message(LOG_DEBUG, "connection with %s is secure", ipstr(peer.ip));
     peer.ssl = ssl;
     peer.secure = 1;
     return peer;
@@ -319,45 +374,6 @@ read_file(const char *filename) {
     fclose(f);
 
     return file;
-}
-
-struct file_cache {
-    char *filepath;
-    char *file_contents;
-    time_t last_edit;
-};
-
-struct file_cache *filecache = NULL;
-size_t filecache_size = 0;
-
-void
-free_filecache(void) {
-    for (size_t i = 0; i < filecache_size; i++) {
-        if (filecache[i].file_contents != NULL) free(filecache[i].file_contents);
-        if (filecache[i].filepath != NULL) free(filecache[i].filepath);
-    }
-    free(filecache);
-}
-
-struct file_cache*
-filecache_find(const char *filepath) {
-    for (size_t i = 0; i < filecache_size; i++) {
-        if (!strcmp(filepath, filecache[i].filepath))
-            return &filecache[i];
-    }
-    return NULL;
-}
-
-void
-file_cache_append(const char *filepath, char *file, time_t last_edit) {
-    char *filepath_alloc = malloc(strlen(filepath) + 1);
-    strcpy(filepath_alloc, filepath);
-    filecache_size++;
-    filecache = realloc(filecache, filecache_size * sizeof(struct file_cache));
-    filecache[filecache_size - 1] = 
-        (struct file_cache){
-            filepath_alloc, file, last_edit
-        };
 }
 
 time_t
@@ -865,6 +881,8 @@ configure_ssl_context(SSL_CTX *ctx, const char *crt, const char *key) {
     }
 }
 
+#include <signal.h>
+
 int
 main(int argc, char **argv) {
     if (argc < 2) {
@@ -882,56 +900,67 @@ main(int argc, char **argv) {
         next_blacklist = 0,
         next_cert = 0,
         next_key = 0;
-    for (int i = 0; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (next_dir) {
             next_dir = 0;
             dir = argv[i];
+            continue;
         }
         if (next_port) {
             next_port = 0;
             port = atoi(argv[i]);
+            continue;
         }
         if (next_sport) {
             next_sport = 0;
             sport = atoi(argv[i]);
+            continue;
         }
         if (next_cert) {
             next_cert = 0;
             certfile = argv[i];
+            continue;
         }
         if (next_key) {
             next_key = 0;
             keyfile = argv[i];
+            continue;
         }
         if (next_blacklist) {
             next_blacklist = 0;
             sport = atoi(argv[i]);
+            continue;
         }
         if (!strcmp(argv[i], "dir")
           ||!strcmp(argv[i], "d")) next_dir = 1;
-        if (!strcmp(argv[i], "port")
+        else if (!strcmp(argv[i], "port")
           ||!strcmp(argv[i], "p")) next_port = 1;
-        if (!strcmp(argv[i], "sport")
+        else if (!strcmp(argv[i], "sport")
           ||!strcmp(argv[i], "s")) next_sport = 1;
-        if (!strcmp(argv[i], "blacklist")
+        else if (!strcmp(argv[i], "blacklist")
           ||!strcmp(argv[i], "b")) next_blacklist = 1;
-        if (!strcmp(argv[i], "cert")
+        else if (!strcmp(argv[i], "cert")
           ||!strcmp(argv[i], "c")) next_cert = 1;
-        if (!strcmp(argv[i], "key")
+        else if (!strcmp(argv[i], "key")
           ||!strcmp(argv[i], "k")) next_key = 1;
-        if (!strcmp(argv[i], "verbose")
+        else if (!strcmp(argv[i], "verbose")
           ||!strcmp(argv[i], "v"))
             enforce_loglevel = LOG_DEBUG;
-        if (!strcmp(argv[i], "quiet")
+        else if (!strcmp(argv[i], "quiet")
           ||!strcmp(argv[i], "q"))
             enforce_loglevel = LOG_ERROR;
-        if (!strcmp(argv[i], "silent")
+        else if (!strcmp(argv[i], "silent")
           ||!strcmp(argv[i], "qq"))
             enforce_loglevel = LOG_ERROR;
-        if (!strcmp(argv[i], "help") || !strcmp(argv[i], "usage")
+        else if (!strcmp(argv[i], "help") || !strcmp(argv[i], "usage")
           ||!strcmp(argv[i], "h")) {
             usage(argv[0]);
             exit(0);
+        }
+        else {
+            printf("Uknown option '%s'\n", argv[i]);
+            usage(argv[0]);
+            exit(1);
         }
     }
 
@@ -964,7 +993,7 @@ main(int argc, char **argv) {
 
     if (enforce_loglevel != LOG_NONE) {
         printf("HYPER-C HTTP/S SERVER VERSION v0.5\n"
-               "--------------------------------\n");
+               "----------------------------------\n");
         if (blacklist_len)
             printf("Blacklisted resources:\n");
         for (size_t i = 0; i < blacklist_len; i++) {
@@ -974,6 +1003,7 @@ main(int argc, char **argv) {
 
     atexit(free_blacklist);
     atexit(free_filecache);
+    signal(SIGPIPE, SIG_IGN);
 
     const int listen_queue = 1000;
 
