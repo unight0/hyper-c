@@ -14,6 +14,8 @@
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 /*
  * TODO
@@ -171,13 +173,15 @@ ipstr(long ip) {
 
 struct peer {
     pid_t sock;
+    SSL *ssl;
     long ip;
     short port;
+    int secure;
     int closed;
 };
 
 struct peer
-accept_conns(pid_t sock) {
+accept_conn(pid_t sock) {
     assert(sock != -1);
     struct sockaddr_in peer_addr;
     socklen_t peer_socklen = sizeof(struct sockaddr_in);
@@ -187,7 +191,7 @@ accept_conns(pid_t sock) {
 
     if (peer == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return (struct peer){-1,0,0,0};
+            return (struct peer){-1,NULL,0,0,0,0};
         if (errno == ECONNABORTED) {
             message(LOG_INFO, "connection was aborted");
         }
@@ -202,12 +206,67 @@ accept_conns(pid_t sock) {
 
     return (struct peer) {
         peer, 
+        NULL,
         htonl(peer_addr.sin_addr.s_addr), 
         htons(peer_addr.sin_port),
+        0,
         0
     };
 }
 
+struct peer
+accept_secure_conn(SSL_CTX *ctx, pid_t sock) {
+    assert(sock != -1);
+    assert(ctx != NULL);
+
+    struct peer peer = accept_conn(sock);
+    if (peer.sock == -1) return peer;
+
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, peer.sock);
+
+    int ret;
+try_again:
+    if ((ret = SSL_accept(ssl)) <= 0) {
+        if (SSL_get_error(ssl, ret) == SSL_ERROR_WANT_READ) goto try_again;
+        ERR_print_errors_fp(stdout);
+        close(peer.sock);
+        return (struct peer) {-1,NULL,0,0,0,0};
+    }
+
+    //message(LOG_DEBUG, "accepted secure connection from %s", ipstr(peer.ip));
+    peer.ssl = ssl;
+    peer.secure = 1;
+    return peer;
+}
+
+struct peer*
+accept_conns(pid_t sock, struct peer *peers, size_t *peers_len) {
+    while(1) {
+        struct peer peer = accept_conn(sock);
+        if (peer.sock == -1) break;
+    
+        (*peers_len)++;
+        peers = realloc(peers, sizeof(struct peer) * *peers_len);
+        assert(peers != NULL);
+        peers[*peers_len-1] = peer;
+    }
+    return peers;
+}
+
+struct peer*
+accept_secure_conns(SSL_CTX *ctx, pid_t sock, struct peer *peers, size_t *peers_len) {
+    while(1) {
+        struct peer peer = accept_secure_conn(ctx, sock);
+        if (peer.sock == -1) break;
+    
+        (*peers_len)++;
+        peers = realloc(peers, sizeof(struct peer) * *peers_len);
+        assert(peers != NULL);
+        peers[*peers_len-1] = peer;
+    }
+    return peers;
+}
 /*
  * Removes the peers that have closed=1 property set
  * */
@@ -520,9 +579,18 @@ reply(struct peer *peer,
     snprintf(buffer, total_len, "%s %s\r\n%s\r\n%s", ver, response, header, send_content ? content : "");
 
     message(LOG_INFO, "sending %d response to %s", response_code, ipstr(peer->ip));
-    if (send(peer->sock, buffer, strlen(buffer), 0) < 0) {
-        perror("send()");
-        peer->closed = 1;
+
+    if (peer->secure) {
+        if (SSL_write(peer->ssl, buffer, strlen(buffer)) <= 0) {
+            ERR_print_errors_fp(stdout);
+            peer->closed = 1;
+        }
+    }
+    else {
+        if (send(peer->sock, buffer, strlen(buffer), 0) < 0) {
+            perror("send()");
+            peer->closed = 1;
+        }
     }
 }
 
@@ -604,18 +672,30 @@ serve_peer(struct peer *peer, const char *rootdir)  {
     //NOTE: why would a HTTP request be more that 4096 bytes, though?
     static char buffer[4096];
     memset(buffer, 0, 4096);
-    ssize_t got = recv(peer->sock, buffer, 4096, 0);
+    ssize_t got;
+
+    if (peer->secure)
+        got = SSL_read(peer->ssl, buffer, 4096);
+    else
+        got = recv(peer->sock, buffer, 4096, 0);
+
     if (!got) {
         peer->closed = 1;
         return;
     }
-    if (got == -1) {
+    if (!peer->secure && got == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
         if (errno == ECONNRESET) {
             peer->closed = 1;
             return;
         }
         perror("recv()");
+        peer->closed = 1;
+        return;
+    }
+    if (peer->secure && got <= 0) {
+        if (SSL_get_error(peer->ssl, got) == SSL_ERROR_WANT_READ) return;
+        ERR_print_errors_fp(stdout);
         peer->closed = 1;
         return;
     }
@@ -712,74 +792,24 @@ serve_peers(struct peer *peers, size_t peers_len, const char *rootdir) {
 
 void
 usage(const char *me) {
-    printf("USAGE: %s DIR PORT [-hqQv] [-b /page1:/page2:...]\n", me);
-    printf("Serves directory DIR at port PORT\n");
-    printf("Options:\n");
-    printf("    -h        Print USAGE\n");
-    printf("    -q        Only log errors\n");
-    printf("    -Q        Don't log anything\n");
-    printf("    -v        Be verbose; debug loglevel\n");
-    printf("    -b        Blacklist certain resources. Examples:\n");
-    printf("              %s . 4380 -b /main.c:/secret_data.txt\n", me);
-    printf("              %s . 4380 -b /*.secret:/secret_directory/*:\n", me);
+    printf("USAGE: %s d DIR [p PORT] [s SPORT c CERTFILE k KEYFILE] [h|v|q|qq|b /page1:/page2:...]\n", me);
+    printf("Server directory DIR at insecure port PORT and/or\n"
+           "at secure port SPORT with certificate file CERTFILE and\n"
+           "key file KEYFILE.\n"
+           "Options:\n"
+           "    h  | help|usage  Print the USAGE page\n"
+           "    q  | quiet       Only log errors\n"
+           "    qq | silent      Don't log anything\n"
+           "    v  | verbose     Be verbose: debug loglevel\n"
+           "    b  | blacklist   Blacklist certain resources. Examples:\n"
+           "                     %s dir . port 4380 blacklist /main.c:/secret_dat.txt\n"
+           "                     %s die . port 4380 blacklist /*.secret:/secret_directory/*\n"
+           "    k  | key         Path to the private key PEM file\n"
+           "    c  | cert        Path to the server certificate file\n", me, me);
 }
 
-int
-main(int argc, char **argv) {
-    if (argc < 3) {
-        usage(argv[0]);
-        exit(0);
-    }
-    const char *dir = argv[1];
-    const int port = atoi(argv[2]);
-
-    int next_blacklist = 0;
-    for (int i = 3; i < argc; i++) {
-        if (next_blacklist) {
-            next_blacklist = 0;
-            parse_blacklist(argv[i], dir);
-            continue;
-        }
-        if (*argv[i] != '-' || strlen(argv[i]) < 2) {
-            printf("Unknown option '%s'\n", argv[i]);
-            usage(argv[0]);
-            exit(1);
-        }
-        for (size_t j = 1; j < strlen(argv[i]); j++) {
-            if (argv[i][j] == 'q')
-                enforce_loglevel = LOG_ERROR;
-            else if (argv[i][j] == 'Q')
-                enforce_loglevel = LOG_NONE;
-            else if (argv[i][j] == 'v')
-                enforce_loglevel = LOG_DEBUG;
-            else if (argv[i][j] == 'h') {
-                usage(argv[0]);
-                exit(0);
-            }
-            else if (argv[i][j] == 'b') {
-                next_blacklist = 1;
-            }
-            else {
-                printf("Unknown option '%c'\n", argv[i][j]);
-                usage(argv[0]);
-                exit(1);
-            }
-        }
-    }
-
-    if (enforce_loglevel != LOG_NONE) {
-        printf("HYPER-C HTTP SERVER VERSION v0.3\n"
-               "--------------------------------\n");
-        if (blacklist_len)
-            printf("Blacklisted resources:\n");
-        for (size_t i = 0; i < blacklist_len; i++) {
-            printf("    %s\n", blacklist[i]);
-        }
-    }
-
-    atexit(free_blacklist);
-
-    const int listen_queue = 1000;
+pid_t
+init_socket(int port, int listen_queue) {
     pid_t sock = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0); 
     if (sock == -1) {
         perror("socket()");
@@ -806,19 +836,171 @@ main(int argc, char **argv) {
         exit(1);
     }
     message(LOG_INFO, "listening on port %d", port);
+    return sock;
+}
+
+SSL_CTX *
+create_ssl_context(void) {
+    const SSL_METHOD *method = TLS_server_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+
+    if (ctx == NULL) {
+        ERR_print_errors_fp(stdout);
+        exit(1);
+    }
+
+    return ctx;
+}
+
+void
+configure_ssl_context(SSL_CTX *ctx, const char *crt, const char *key) {
+    if (SSL_CTX_use_certificate_file(ctx, crt, SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stdout);
+        exit(1);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0 ) {
+        ERR_print_errors_fp(stdout);
+        exit(1);
+    }
+}
+
+int
+main(int argc, char **argv) {
+    if (argc < 2) {
+        usage(argv[0]);
+        exit(0);
+    }
+    char *dir = NULL;
+    int port = 0, sport = 0;
+    char *certfile = NULL, *keyfile = NULL;
+    char *blacklist_str = NULL;
+
+    int next_dir = 0,
+        next_port = 0,
+        next_sport = 0,
+        next_blacklist = 0,
+        next_cert = 0,
+        next_key = 0;
+    for (int i = 0; i < argc; i++) {
+        if (next_dir) {
+            next_dir = 0;
+            dir = argv[i];
+        }
+        if (next_port) {
+            next_port = 0;
+            port = atoi(argv[i]);
+        }
+        if (next_sport) {
+            next_sport = 0;
+            sport = atoi(argv[i]);
+        }
+        if (next_cert) {
+            next_cert = 0;
+            certfile = argv[i];
+        }
+        if (next_key) {
+            next_key = 0;
+            keyfile = argv[i];
+        }
+        if (next_blacklist) {
+            next_blacklist = 0;
+            sport = atoi(argv[i]);
+        }
+        if (!strcmp(argv[i], "dir")
+          ||!strcmp(argv[i], "d")) next_dir = 1;
+        if (!strcmp(argv[i], "port")
+          ||!strcmp(argv[i], "p")) next_port = 1;
+        if (!strcmp(argv[i], "sport")
+          ||!strcmp(argv[i], "s")) next_sport = 1;
+        if (!strcmp(argv[i], "blacklist")
+          ||!strcmp(argv[i], "b")) next_blacklist = 1;
+        if (!strcmp(argv[i], "cert")
+          ||!strcmp(argv[i], "c")) next_cert = 1;
+        if (!strcmp(argv[i], "key")
+          ||!strcmp(argv[i], "k")) next_key = 1;
+        if (!strcmp(argv[i], "verbose")
+          ||!strcmp(argv[i], "v"))
+            enforce_loglevel = LOG_DEBUG;
+        if (!strcmp(argv[i], "quiet")
+          ||!strcmp(argv[i], "q"))
+            enforce_loglevel = LOG_ERROR;
+        if (!strcmp(argv[i], "silent")
+          ||!strcmp(argv[i], "qq"))
+            enforce_loglevel = LOG_ERROR;
+        if (!strcmp(argv[i], "help") || !strcmp(argv[i], "usage")
+          ||!strcmp(argv[i], "h")) {
+            usage(argv[0]);
+            exit(0);
+        }
+    }
+
+    if (dir == NULL) {
+        printf("You must specify the directory to serve\n");
+        usage(argv[0]);
+        exit(1);
+    }
+
+    if (port == 0 && sport == 0) {
+        printf("You must specify the insecure or secure port to serve at\n");
+        usage(argv[0]);
+        exit(1);
+    }
+
+    if (sport && (certfile == NULL || keyfile == NULL)) {
+        printf("You must specify the keyfile and certfile if you are using the secure connection over HTTPS\n");
+        usage(argv[0]);
+        exit(1);
+    }
+
+    if (!sport && (certfile != NULL || keyfile != NULL)) {
+        printf("You have specified either certfile or keyfile, but not the secure port\n");
+        usage(argv[0]);
+        exit(1);
+    }
+    
+    if (blacklist_str != NULL)
+        parse_blacklist(blacklist_str, dir);
+
+    if (enforce_loglevel != LOG_NONE) {
+        printf("HYPER-C HTTP/S SERVER VERSION v0.5\n"
+               "--------------------------------\n");
+        if (blacklist_len)
+            printf("Blacklisted resources:\n");
+        for (size_t i = 0; i < blacklist_len; i++) {
+            printf("    %s\n", blacklist[i]);
+        }
+    }
+
+    atexit(free_blacklist);
+    atexit(free_filecache);
+
+    const int listen_queue = 1000;
+
+    pid_t sock = -1;
+    if (port)
+        sock = init_socket(port, listen_queue);
+
+    SSL_CTX *ctx = NULL;
+    pid_t ssock = -1;
+    if (sport) {
+        SSL_load_error_strings();
+        OpenSSL_add_ssl_algorithms();
+        ctx = create_ssl_context();
+        configure_ssl_context(ctx, certfile, keyfile);
+        ssock = init_socket(sport, listen_queue);
+    }
+
     int running = 1;
     struct peer *peers = NULL;
     size_t peers_len = 0;
     while (running) {
         peers = cleanup_peers(peers, &peers_len);
-        while(1) {
-            struct peer peer = accept_conns(sock);
-            if (peer.sock == -1) break;
-
-            peers_len++;
-            peers = realloc(peers, sizeof(struct peer) * peers_len);
-            assert(peers != NULL);
-            peers[peers_len-1] = peer;
+        if (port) {
+            peers = accept_conns(sock, peers, &peers_len);
+        }
+        if (sport) {
+            peers = accept_secure_conns(ctx, ssock, peers, &peers_len);
         }
         serve_peers(peers, peers_len, dir);
     }
@@ -828,4 +1010,6 @@ main(int argc, char **argv) {
         exit(1);
     }
     message(LOG_DEBUG, "closed socket");
+
+    EVP_cleanup();
 }

@@ -1,3 +1,4 @@
 *.o
 site/*
 hyprc
+server.*

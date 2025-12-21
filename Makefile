@@ -1,7 +1,7 @@
 CC = gcc
 LD = gcc
 CFLAGS = -Wall -Wextra -g
-LDFLAGS = 
+LDFLAGS = -lssl -lcrypto
 SRCS = $(wildcard *.c)
 OBJS = $(SRCS:.c=.o)
 TARGET = hyprc
