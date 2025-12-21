@@ -13,17 +13,14 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/stat.h>
-
 #include <sys/socket.h>
 
 /*
  * TODO
- * + Allow blacklisting directories (file wildcards?)
- * + Pre-load files and re-load them if changed -> will reduce load
- * + Poll in a smarter way -- do not re-create the pollfd structure (?)
+ * + DONE _Allow blacklisting directories (file wildcards?)_
+ * + DONE _Pre-load files and re-load them if changed -> will reduce load_
+ * + NOT NEEDED _Poll in a smarter way -- do not re-create the pollfd structure (?)_
  * + DONE _Return 405 Method Not Allowed instead of empty response_
- * + Smart file for blacklist parsing -- partially interescts with directory
- *   blacklisting
  * + HTTPS Serving. Use OpenSSL
  * Additionals (*)
  * + Allow routing methods through CGIs
@@ -65,13 +62,13 @@ message(int loglevel, const char *fmt, ...) {
     va_end(vl);
 }
 
-uint64_t
-milliseconds(void) {
-    static struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000
-        +  (uint64_t)ts.tv_nsec / 1000000;
-}
+//uint64_t
+//milliseconds(void) {
+//    static struct timespec ts;
+//    clock_gettime(CLOCK_MONOTONIC, &ts);
+//    return (uint64_t)ts.tv_sec * 1000
+//        +  (uint64_t)ts.tv_nsec / 1000000;
+//}
 
 
 char **blacklist = NULL;
@@ -109,6 +106,29 @@ is_blacklisted(const char *str, const char *dir) {
 }
 
 void
+blacklist_append(char *path) {
+    blacklist_len++;
+    blacklist = realloc(blacklist, blacklist_len * sizeof(char*));
+    blacklist[blacklist_len - 1] = path;
+}
+
+#include <glob.h>
+
+int
+resource_glob(glob_t *glb, const char *resource, const char *dir) {
+    size_t relpath_sz = strlen(dir) + strlen(resource) + 2;
+    char relpath[relpath_sz];
+    snprintf(relpath, relpath_sz, "%s/%s", dir, resource);
+
+    if (glob(relpath, GLOB_NOSORT|GLOB_TILDE, NULL, glb) == GLOB_NOMATCH) {
+        perror("glob()");
+        return 1;
+    }
+
+    return 0;
+}
+
+void
 parse_blacklist(char *str, const char *dir) {
     char *tok = strtok(str, ":");
     if (tok == NULL) {
@@ -116,12 +136,12 @@ parse_blacklist(char *str, const char *dir) {
         exit(1);
     }
     do {
-        char *path = resource_abspath(tok, dir);
-        if (path == NULL) return;
-
-        blacklist_len++;
-        blacklist = realloc(blacklist, blacklist_len * sizeof(char*));
-        blacklist[blacklist_len - 1] = path;
+        glob_t glob;
+        if (resource_glob(&glob, tok, dir)) return;
+        for (size_t i = 0; i < glob.gl_pathc; i++) {
+            blacklist_append(realpath(glob.gl_pathv[i], NULL));
+        }
+        globfree(&glob);
     } while((tok = strtok(NULL, ":")) != NULL);
 }
 
@@ -290,28 +310,20 @@ last_edit_time(const char *filepath) {
 
 char *
 get_file(const char *filepath) {
-    uint64_t begin = milliseconds(), end;
     time_t last_edit = last_edit_time(filepath);
     struct file_cache *cache = filecache_find(filepath);
 
     if (cache != NULL) {
-        if (last_edit <= cache->last_edit) {
-            end = milliseconds();
-            printf("get_file(): %lu\n", end - begin);
-            return cache->file_contents;
-        }
+        if (last_edit <= cache->last_edit) return cache->file_contents;
+
         cache->last_edit = last_edit;
         free(cache->file_contents);
         cache->file_contents = read_file(filepath);
-        end = milliseconds();
-        printf("get_file(): %lu\n", end - begin);
         return cache->file_contents;
     }
 
     char *file = read_file(filepath);
     file_cache_append(filepath, file, last_edit);
-    end = milliseconds();
-    printf("get_file(): %lu\n", end - begin);
     return file;
 }
 
@@ -575,6 +587,16 @@ serve_options_request(struct request req, struct peer *peer) {
     reply(peer, 204, req.method, req.ver, NULL, NULL, 0);
 }
 
+int
+is_dir(const char *filepath) {
+    struct stat st;
+    if (stat(filepath, &st) == -1) {
+        perror("stat()");
+        return 0;
+    }
+    return S_ISDIR(st.st_mode);
+}
+
 void
 serve_peer(struct peer *peer, const char *rootdir)  {
     assert(peer->sock != -1);
@@ -614,11 +636,17 @@ serve_peer(struct peer *peer, const char *rootdir)  {
         message(LOG_INFO, "Query is %s\n", req.query);
     }
 
-    if (!strcmp(req.target, "/")) {
-        if (is_blacklisted("/", rootdir))
-            reply(peer, 404, req.method, req.ver, NULL, NULL, 0);
-        else 
-            req.target = DEFAULT_DIRECTORY_SERVE;
+    // E.g. serve /index.html instead of /
+    // Or serve /test/index.html instead of /test/
+    size_t target_len = strlen(req.target)
+                      + strlen(DEFAULT_DIRECTORY_SERVE)
+                      + strlen(rootdir)
+                      + 2;
+    char target[target_len];
+    snprintf(target, target_len, "%s/%s", rootdir, req.target);
+    if (is_dir(target)) {
+        snprintf(target, target_len, "%s/%s", req.target, DEFAULT_DIRECTORY_SERVE);
+        req.target = target;
     }
 
     if (is_blacklisted(req.target, rootdir)) {
@@ -664,7 +692,6 @@ serve_peer(struct peer *peer, const char *rootdir)  {
 
 void
 serve_peers(struct peer *peers, size_t peers_len, const char *rootdir) {
-    uint64_t begin = milliseconds();
     struct pollfd poll_fds[peers_len];
 
     if (peers_len == 0) return;
@@ -681,8 +708,6 @@ serve_peers(struct peer *peers, size_t peers_len, const char *rootdir) {
         if (poll_fds[i].revents & POLLIN)
             serve_peer(&peers[i], rootdir);
     }
-    uint64_t end = milliseconds();
-    printf("serve_peers(): %lu\n", end - begin);
 }
 
 void
@@ -694,8 +719,9 @@ usage(const char *me) {
     printf("    -q        Only log errors\n");
     printf("    -Q        Don't log anything\n");
     printf("    -v        Be verbose; debug loglevel\n");
-    printf("    -b        Blacklist certain resources. Example:\n");
+    printf("    -b        Blacklist certain resources. Examples:\n");
     printf("              %s . 4380 -b /main.c:/secret_data.txt\n", me);
+    printf("              %s . 4380 -b /*.secret:/secret_directory/*:\n", me);
 }
 
 int
@@ -742,7 +768,7 @@ main(int argc, char **argv) {
     }
 
     if (enforce_loglevel != LOG_NONE) {
-        printf("HYPER-C HTTP SERVER VERSION v0.2\n"
+        printf("HYPER-C HTTP SERVER VERSION v0.3\n"
                "--------------------------------\n");
         if (blacklist_len)
             printf("Blacklisted resources:\n");
