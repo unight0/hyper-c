@@ -1,21 +1,44 @@
+// For accept4
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <assert.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#include <sys/socket.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <sys/stat.h>
+
+#include <sys/socket.h>
+
+/*
+ * TODO
+ * + Allow blacklisting directories (file wildcards?)
+ * + Pre-load files and re-load them if changed -> will reduce load
+ * + Poll in a smarter way -- do not re-create the pollfd structure (?)
+ * + DONE _Return 405 Method Not Allowed instead of empty response_
+ * + Smart file for blacklist parsing -- partially interescts with directory
+ *   blacklisting
+ * + HTTPS Serving. Use OpenSSL
+ * Additionals (*)
+ * + Allow routing methods through CGIs
+ * + FastCGI support
+ * */
 
 #define SERVER_NAME "HyperC"
+#define DEFAULT_DIRECTORY_SERVE "index.html"
 
 #define LOG_DEBUG 2
 #define LOG_INFO  1
 #define LOG_ERROR 0
+#define LOG_NONE  -1
 
-int enforce_loglevel = LOG_DEBUG;
+int enforce_loglevel = LOG_INFO;
 
 const char*
 loglevel_tostr(int loglevel) {
@@ -42,29 +65,71 @@ message(int loglevel, const char *fmt, ...) {
     va_end(vl);
 }
 
+uint64_t
+milliseconds(void) {
+    static struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000
+        +  (uint64_t)ts.tv_nsec / 1000000;
+}
+
+
 char **blacklist = NULL;
 size_t blacklist_len = 0;
 
-int
-is_blacklisted(const char *str) {
-    for (size_t i = 0; i < blacklist_len; i++) {
-        if (!strcmp(blacklist[i], str)) return 1;
+char *
+resource_abspath(const char *resource, const char *dir) {
+    size_t relpath_sz = strlen(dir) + strlen(resource) + 2;
+    char relpath[relpath_sz];
+    snprintf(relpath, relpath_sz, "%s/%s", dir, resource);
+
+    char *path = realpath(relpath, NULL);
+    if (path == NULL) {
+        printf("Could not find the absolute path of '%s'\n", relpath);
+        perror("realpath()");
+        return NULL;
     }
+
+    return path;
+}
+
+int
+is_blacklisted(const char *str, const char *dir) {
+    char *strpath = resource_abspath(str, dir);
+    if (strpath == NULL) return 0;
+
+    for (size_t i = 0; i < blacklist_len; i++) {
+        if (!strcmp(blacklist[i], strpath)) {
+            free(strpath);
+            return 1;
+        }
+    }
+    free(strpath);
     return 0;
 }
 
 void
-parse_blacklist(char *str) {
+parse_blacklist(char *str, const char *dir) {
     char *tok = strtok(str, ":");
     if (tok == NULL) {
         printf("Could not parse the blacklist!\n");
         exit(1);
     }
     do {
+        char *path = resource_abspath(tok, dir);
+        if (path == NULL) return;
+
         blacklist_len++;
         blacklist = realloc(blacklist, blacklist_len * sizeof(char*));
-        blacklist[blacklist_len - 1] = tok;
+        blacklist[blacklist_len - 1] = path;
     } while((tok = strtok(NULL, ":")) != NULL);
+}
+
+void
+free_blacklist(void) {
+    for (size_t i = 0; i < blacklist_len; i++) {
+        free(blacklist[i]);
+    }
 }
 
 
@@ -96,9 +161,9 @@ accept_conns(pid_t sock) {
     assert(sock != -1);
     struct sockaddr_in peer_addr;
     socklen_t peer_socklen = sizeof(struct sockaddr_in);
-    int peer = accept(sock,
+    int peer = accept4(sock,
             (struct sockaddr*) &peer_addr,
-            &peer_socklen);
+            &peer_socklen, SOCK_NONBLOCK);
 
     if (peer == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -155,7 +220,10 @@ is_prefix(const char *str, const char *prfx) {
 char*
 read_file(const char *filename) {
     FILE *f = fopen(filename, "r");
-    if (f == NULL) return NULL;
+    if (f == NULL) {
+        message(LOG_DEBUG, "fopen(): %s", strerror(errno));
+        return NULL;
+    }
 
     char *file = NULL;
     size_t file_size = 0;
@@ -169,8 +237,84 @@ read_file(const char *filename) {
 
     file[file_size - 1] = 0;
 
+    fclose(f);
+
     return file;
 }
+
+struct file_cache {
+    char *filepath;
+    char *file_contents;
+    time_t last_edit;
+};
+
+struct file_cache *filecache = NULL;
+size_t filecache_size = 0;
+
+void
+free_filecache(void) {
+    for (size_t i = 0; i < filecache_size; i++) {
+        if (filecache[i].file_contents != NULL) free(filecache[i].file_contents);
+        if (filecache[i].filepath != NULL) free(filecache[i].filepath);
+    }
+    free(filecache);
+}
+
+struct file_cache*
+filecache_find(const char *filepath) {
+    for (size_t i = 0; i < filecache_size; i++) {
+        if (!strcmp(filepath, filecache[i].filepath))
+            return &filecache[i];
+    }
+    return NULL;
+}
+
+void
+file_cache_append(const char *filepath, char *file, time_t last_edit) {
+    char *filepath_alloc = malloc(strlen(filepath) + 1);
+    strcpy(filepath_alloc, filepath);
+    filecache_size++;
+    filecache = realloc(filecache, filecache_size * sizeof(struct file_cache));
+    filecache[filecache_size - 1] = 
+        (struct file_cache){
+            filepath_alloc, file, last_edit
+        };
+}
+
+time_t
+last_edit_time(const char *filepath) {
+    struct stat st;
+    if (stat(filepath, &st) == -1) return 0;
+    return st.st_mtime;
+}
+
+char *
+get_file(const char *filepath) {
+    uint64_t begin = milliseconds(), end;
+    time_t last_edit = last_edit_time(filepath);
+    struct file_cache *cache = filecache_find(filepath);
+
+    if (cache != NULL) {
+        if (last_edit <= cache->last_edit) {
+            end = milliseconds();
+            printf("get_file(): %lu\n", end - begin);
+            return cache->file_contents;
+        }
+        cache->last_edit = last_edit;
+        free(cache->file_contents);
+        cache->file_contents = read_file(filepath);
+        end = milliseconds();
+        printf("get_file(): %lu\n", end - begin);
+        return cache->file_contents;
+    }
+
+    char *file = read_file(filepath);
+    file_cache_append(filepath, file, last_edit);
+    end = milliseconds();
+    printf("get_file(): %lu\n", end - begin);
+    return file;
+}
+
 
 char *
 get_extension(char *filepath) {
@@ -194,9 +338,9 @@ get_content_type(const char *extension) {
 }
 
 char *
-get_header(const char *method, const char *content, char *filepath) {
+get_header(int code, const char *method, const char *content, char *filepath) {
     char *extra_headers = "";
-    if (!strcmp(method, "OPTIONS")) {
+    if (!strcmp(method, "OPTIONS") || code == 405) {
         extra_headers = "Allow: OPTIONS, GET, HEAD, POST\r\n";
     }
 
@@ -334,6 +478,8 @@ response_by_code(int response_code) {
     switch (response_code) {
         case 404:
             return "404 Not Found";
+        case 405:
+            return "405 Method Not Allowed";
         case 200:
             return "200 OK";
         case 204:
@@ -352,7 +498,7 @@ reply(struct peer *peer,
       char *filepath,
       int send_content) {
     const char *response = response_by_code(response_code);
-    const char *header = get_header(method, content, filepath);
+    const char *header = get_header(response_code, method, content, filepath);
 
     size_t content_len = 0;
     if (content != NULL) content_len = strlen(content);
@@ -375,7 +521,7 @@ serve_head_request(struct request req, struct peer *peer, const char *rootdir) {
     
     char filepath[strlen(req.target) + strlen(rootdir) + 2];
     snprintf(filepath, strlen(req.target) + strlen(rootdir) + 2, "%s/%s", rootdir, req.target);
-    char *file = read_file(filepath);
+    char *file = get_file(filepath);
 
     if (file == NULL) {
         reply(peer, 404, req.method, req.ver, NULL, NULL, 0);
@@ -383,8 +529,6 @@ serve_head_request(struct request req, struct peer *peer, const char *rootdir) {
     }
 
     reply(peer, 200, req.method, req.ver, file, filepath, 0);
-
-    free(file);
 }
 
 void
@@ -394,7 +538,7 @@ serve_get_request(struct request req, struct peer *peer, const char *rootdir) {
 
     char filepath[strlen(req.target) + strlen(rootdir) + 2];
     snprintf(filepath, strlen(req.target) + strlen(rootdir) + 2, "%s/%s", rootdir, req.target);
-    char *file = read_file(filepath);
+    char *file = get_file(filepath);
 
     if (file == NULL) {
         reply(peer, 404, req.method, req.ver, NULL, NULL, 0);
@@ -402,7 +546,6 @@ serve_get_request(struct request req, struct peer *peer, const char *rootdir) {
     }
 
     reply(peer, 200, req.method, req.ver, file, filepath, 1);
-    free(file);
 }
 
 void
@@ -412,7 +555,7 @@ serve_post_request(struct request req, struct peer *peer, const char *rootdir) {
 
     char filepath[strlen(req.target) + strlen(rootdir) + 2];
     snprintf(filepath, strlen(req.target) + strlen(rootdir) + 2, "%s/%s", rootdir, req.target);
-    char *file = read_file(filepath);
+    char *file = get_file(filepath);
 
     if (file == NULL) {
         reply(peer, 404, req.method, req.ver, NULL, NULL, 0);
@@ -420,7 +563,6 @@ serve_post_request(struct request req, struct peer *peer, const char *rootdir) {
     }
 
     reply(peer, 200, req.method, req.ver, file, filepath, 1);
-    free(file);
 
     message(LOG_INFO, "%s POSTed '%s' at %s", ip_str, req.content, req.target);
 }
@@ -437,6 +579,7 @@ void
 serve_peer(struct peer *peer, const char *rootdir)  {
     assert(peer->sock != -1);
     //TODO: re-write this so there's no possible message cutoff
+    //NOTE: why would a HTTP request be more that 4096 bytes, though?
     static char buffer[4096];
     memset(buffer, 0, 4096);
     ssize_t got = recv(peer->sock, buffer, 4096, 0);
@@ -472,34 +615,40 @@ serve_peer(struct peer *peer, const char *rootdir)  {
     }
 
     if (!strcmp(req.target, "/")) {
-        if (is_blacklisted("/"))
+        if (is_blacklisted("/", rootdir))
             reply(peer, 404, req.method, req.ver, NULL, NULL, 0);
         else 
-            req.target = "/index.html";
+            req.target = DEFAULT_DIRECTORY_SERVE;
     }
 
-    if (is_blacklisted(req.target)) {
+    if (is_blacklisted(req.target, rootdir)) {
+        message(LOG_DEBUG, "'%s' is blacklisted; replying 404", req.target);
         reply(peer, 404, req.method, req.ver, NULL, NULL, 0);
     }
 
     else if (!strcmp(req.method, "GET")) {
+        message(LOG_DEBUG, "Serving GET '%s' to %s", req.target, ipstr(peer->ip));
         serve_get_request(req, peer, rootdir);
     }
 
     else if (!strcmp(req.method, "HEAD")) {
+        message(LOG_DEBUG, "Serving HEAD '%s' to %s", req.target, ipstr(peer->ip));
         serve_head_request(req, peer, rootdir);
     }
 
     else if (!strcmp(req.method, "POST")) {
+        message(LOG_DEBUG, "Serving POST '%s' to %s", req.target, ipstr(peer->ip));
         serve_post_request(req, peer, rootdir);
     }
 
     else if (!strcmp(req.method, "OPTIONS")) {
+        message(LOG_DEBUG, "Serving OPTIONS '%s' to %s", req.target, ipstr(peer->ip));
         serve_options_request(req, peer);
     }
 
     else {
         message(LOG_ERROR, "unknown HTTP request received, method = '%s'", req.method);
+        reply(peer, 405, req.method, req.ver, NULL, NULL, 0);
         peer->closed = 1;
     }
 
@@ -513,10 +662,12 @@ serve_peer(struct peer *peer, const char *rootdir)  {
     free(req.headers);
 }
 
-
 void
 serve_peers(struct peer *peers, size_t peers_len, const char *rootdir) {
+    uint64_t begin = milliseconds();
     struct pollfd poll_fds[peers_len];
+
+    if (peers_len == 0) return;
 
     for (size_t i = 0; i < peers_len; i++) {
         poll_fds[i].fd = peers[i].sock;
@@ -530,16 +681,19 @@ serve_peers(struct peer *peers, size_t peers_len, const char *rootdir) {
         if (poll_fds[i].revents & POLLIN)
             serve_peer(&peers[i], rootdir);
     }
+    uint64_t end = milliseconds();
+    printf("serve_peers(): %lu\n", end - begin);
 }
 
 void
 usage(const char *me) {
-    printf("USAGE: %s DIR PORT [-hqQ] [-b /page1:/page2:...]\n", me);
+    printf("USAGE: %s DIR PORT [-hqQv] [-b /page1:/page2:...]\n", me);
     printf("Serves directory DIR at port PORT\n");
     printf("Options:\n");
     printf("    -h        Print USAGE\n");
     printf("    -q        Only log errors\n");
     printf("    -Q        Don't log anything\n");
+    printf("    -v        Be verbose; debug loglevel\n");
     printf("    -b        Blacklist certain resources. Example:\n");
     printf("              %s . 4380 -b /main.c:/secret_data.txt\n", me);
 }
@@ -553,12 +707,11 @@ main(int argc, char **argv) {
     const char *dir = argv[1];
     const int port = atoi(argv[2]);
 
-    int quiet = 0;
     int next_blacklist = 0;
     for (int i = 3; i < argc; i++) {
         if (next_blacklist) {
             next_blacklist = 0;
-            parse_blacklist(argv[i]);
+            parse_blacklist(argv[i], dir);
             continue;
         }
         if (*argv[i] != '-' || strlen(argv[i]) < 2) {
@@ -567,8 +720,12 @@ main(int argc, char **argv) {
             exit(1);
         }
         for (size_t j = 1; j < strlen(argv[i]); j++) {
-            if (argv[i][j] == 'q') quiet = 1;
-            else if (argv[i][j] == 'Q') quiet = 2;
+            if (argv[i][j] == 'q')
+                enforce_loglevel = LOG_ERROR;
+            else if (argv[i][j] == 'Q')
+                enforce_loglevel = LOG_NONE;
+            else if (argv[i][j] == 'v')
+                enforce_loglevel = LOG_DEBUG;
             else if (argv[i][j] == 'h') {
                 usage(argv[0]);
                 exit(0);
@@ -576,11 +733,17 @@ main(int argc, char **argv) {
             else if (argv[i][j] == 'b') {
                 next_blacklist = 1;
             }
+            else {
+                printf("Unknown option '%c'\n", argv[i][j]);
+                usage(argv[0]);
+                exit(1);
+            }
         }
     }
-    enforce_loglevel = LOG_ERROR + 1 - quiet;
 
-    if (!quiet) {
+    if (enforce_loglevel != LOG_NONE) {
+        printf("HYPER-C HTTP SERVER VERSION v0.2\n"
+               "--------------------------------\n");
         if (blacklist_len)
             printf("Blacklisted resources:\n");
         for (size_t i = 0; i < blacklist_len; i++) {
@@ -588,10 +751,9 @@ main(int argc, char **argv) {
         }
     }
 
+    atexit(free_blacklist);
+
     const int listen_queue = 1000;
-    if (!quiet)
-        printf("HYPER-C HTTP SERVER VERSION v0.2\n"
-               "--------------------------------\n");
     pid_t sock = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0); 
     if (sock == -1) {
         perror("socket()");
@@ -623,8 +785,10 @@ main(int argc, char **argv) {
     size_t peers_len = 0;
     while (running) {
         peers = cleanup_peers(peers, &peers_len);
-        struct peer peer = accept_conns(sock);
-        if (peer.sock != -1)  {
+        while(1) {
+            struct peer peer = accept_conns(sock);
+            if (peer.sock == -1) break;
+
             peers_len++;
             peers = realloc(peers, sizeof(struct peer) * peers_len);
             assert(peers != NULL);
