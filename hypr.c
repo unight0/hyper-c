@@ -992,8 +992,8 @@ main(int argc, char **argv) {
         parse_blacklist(blacklist_str, dir);
 
     if (enforce_loglevel != LOG_NONE) {
-        printf("HYPER-C HTTP/S SERVER VERSION v0.5\n"
-               "----------------------------------\n");
+        printf("HYPER-C HTTP/S SERVER VERSION 0.5\n"
+               "---------------------------------\n");
         if (blacklist_len)
             printf("Blacklisted resources:\n");
         for (size_t i = 0; i < blacklist_len; i++) {

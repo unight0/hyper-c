@@ -1,6 +1,6 @@
 CC = gcc
 LD = gcc
-CFLAGS = -Wall -Wextra -g
+CFLAGS = -Wall -Wextra
 LDFLAGS = -lssl -lcrypto
 SRCS = $(wildcard *.c)
 OBJS = $(SRCS:.c=.o)
